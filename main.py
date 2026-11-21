@@ -461,6 +461,11 @@ def parse_pkt_lines(buf):
         if size == 0:
             packets.append(("flush", b""))
             pos += 4
+            # The command section ends at the flush packet: in receive-pack
+            # the raw packfile follows, and it is not pkt-line framed, so
+            # parsing on would choke on its "PACK" header. Stop here and let
+            # the caller treat the rest as the pack.
+            break
         elif size == 1:
             packets.append(("delim", b""))
             pos += 4
@@ -1103,6 +1108,24 @@ class ForgeHandler(BaseHTTPRequestHandler):
 
     # -- request reading -------------------------------------------------------
     def read_body(self):
+        """Return this request's body bytes (buffered up front by _handle)."""
+        body = getattr(self, "_body", None)
+        if body is None:
+            body = self._read_raw_body()
+        self._body = b""
+        return body
+
+    def _read_raw_body(self):
+        """Read the request body off the wire once, whatever the handler does.
+
+        HTTP/1.1 keep-alive reuses the connection for the next request, so a
+        body left unread poisons the next request line (the next request is
+        then parsed as 'Unsupported method' 501 / 400). _handle calls this up
+        front, so error paths that never touch the body cannot poison the
+        stream; handlers just read the buffered copy.
+        """
+        if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            return self._read_chunked_body()
         length = self.headers.get("Content-Length")
         if not length:
             return b""
@@ -1113,8 +1136,37 @@ class ForgeHandler(BaseHTTPRequestHandler):
         if n <= 0:
             return b""
         if n > 64 * 1024 * 1024:
+            # Too big to keep: drain and discard so the connection stays clean.
+            remaining = n
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
             return b""
         return self.rfile.read(n)
+
+    def _read_chunked_body(self):
+        out = bytearray()
+        try:
+            while True:
+                line = self.rfile.readline(65536)
+                if not line:
+                    break
+                size = int(line.split(b";", 1)[0].strip(), 16)
+                if size == 0:
+                    while True:  # trailers until a blank line
+                        trailer = self.rfile.readline(65536)
+                        if not trailer or trailer in (b"\r\n", b"\n"):
+                            break
+                    break
+                out += self.rfile.read(size)
+                self.rfile.read(2)  # trailing CRLF
+                if len(out) > 64 * 1024 * 1024:
+                    return b""
+        except Exception:
+            return bytes(out)
+        return bytes(out)
 
     def read_json(self):
         raw = self.read_body()
@@ -1145,6 +1197,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
         return segments, query, raw
 
     def _handle(self):
+        self._body = self._read_raw_body()
         segments, query, raw_path = self._path_segments()
         method = self.command
         try:
@@ -1428,7 +1481,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
             out.append({
                 "sha": oid,
                 "commit": {
-                    "message": view.get("message", ""),
+                    "message": view.get("message", "").rstrip("\n"),
                     "author": author,
                     "committer": _ident(view.get("committer", "")),
                     "tree": {"sha": view.get("tree", "")},
@@ -1938,7 +1991,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
         return lines
 
     def _v0_advertisement(self, repo, service):
-        caps = ("side-band-64k multi_ack thin-pack ofs-delta agent=forge/1.0 "
+        caps = ("side-band-64k multi_ack multi_ack_detailed thin-pack ofs-delta agent=forge/1.0 "
                 "symref=HEAD:refs/heads/" + repo["default_branch"] + " shallow")
         if service == "git-receive-pack":
             caps = ("report-status side-band-64k delete-refs ofs-delta agent=forge/1.0 "
@@ -2068,12 +2121,18 @@ class ForgeHandler(BaseHTTPRequestHandler):
             included |= STORE.ancestors(tip)
         return included, [], []
 
-    def _fetch_pack_objects(self, included, haves):
+    def _fetch_pack_objects(self, included, haves, wants=(), deepen=None):
         """Objects to send for `included` commits, minus what `haves` cover."""
         excluded = set()
         for tip in haves:
             target = STORE.resolve_to_commit(tip)
             excluded |= STORE.ancestors(target) if target else set()
+        if deepen is not None:
+            # A deepen fetch asks for ancestors of a commit the client holds
+            # only shallowly: the have is a shallow boundary, not full
+            # history, so ancestors inside the new depth are wanted, not
+            # held. Exclude only the ancestors outside the deepened set.
+            excluded -= set(included)
         send = {}
         for oid in sorted(included):
             obj = STORE.get_object(oid)
@@ -2083,6 +2142,12 @@ class ForgeHandler(BaseHTTPRequestHandler):
             tree = STORE.commit_tree(oid)
             if tree:
                 self._collect_tree_objects(tree, send)
+        # A wanted tag object itself is not reachable from its commit, so add
+        # wanted objects directly (a clone of a tag ref wants the tag object).
+        for oid in wants:
+            obj = STORE.get_object(oid)
+            if obj is not None and oid not in send:
+                send[oid] = obj
         # Drop everything the client already holds (closure of the haves).
         if excluded:
             held = STORE.reachable_objects(list(excluded), ())
@@ -2116,18 +2181,22 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     deepen = None
         included, shallow, unshallow = self._fetch_included(wants, haves, shallow_args, deepen)
-        objects = self._fetch_pack_objects(included, haves)
+        objects = self._fetch_pack_objects(included, haves, wants, deepen)
         pack = write_pack(objects)
         out = bytearray()
-        out += pkt_line("acknowledgments\n")
-        acked = False
-        for have in haves:
-            target = STORE.resolve_to_commit(have) or have
-            if any(STORE.is_ancestor(target, tip) for tip in wants):
-                out += pkt_line("ACK %s\n" % have)
-                acked = True
-        out += pkt_line("ready\n" if acked else "NAK\n")
-        out += PKT_DELIM
+        if haves:
+            # The acknowledgments section exists only when the client sent
+            # haves: a clone sends none, and real git then expects the
+            # packfile section directly (GitHub behaves the same way).
+            out += pkt_line("acknowledgments\n")
+            acked = False
+            for have in haves:
+                target = STORE.resolve_to_commit(have) or have
+                if any(STORE.is_ancestor(target, tip) for tip in wants):
+                    out += pkt_line("ACK %s\n" % have)
+                    acked = True
+            out += pkt_line("ready\n" if acked else "NAK\n")
+            out += PKT_DELIM
         if shallow or unshallow:
             out += pkt_line("shallow-info\n")
             for oid in shallow:
@@ -2152,7 +2221,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     deepen = None
         included, shallow, unshallow = self._fetch_included(wants, haves, shallow_args, deepen)
-        objects = self._fetch_pack_objects(included, haves)
+        objects = self._fetch_pack_objects(included, haves, wants, deepen)
         pack = write_pack(objects)
         out = bytearray()
         acked = False
@@ -2739,6 +2808,7 @@ class _GqlParser:
         while not self.at(")"):
             self.take("$")
             name = self.take("NAME")[1]
+            self.take(":")
             defs[name] = self.parse_type()
             if self.at("="):
                 self.take("=")
@@ -3220,7 +3290,7 @@ def _resolve_field(obj, name, args, sub_selections, variables, fragments, errors
         if name == "name":
             return obj.get("name"), True
         return None, False
-    if obj_type == "Edge":
+    if obj_type in ("Edge", "CommentEdge"):
         if name == "node":
             node = obj.get("node")
             if isinstance(node, dict) and "_type" in node:
@@ -3252,6 +3322,36 @@ def _resolve_field(obj, name, args, sub_selections, variables, fragments, errors
     if obj_type == "__Schema":
         if name == "queryType":
             return {"_type": "__Type", "name": "Query"}, True
+        return None, False
+    if obj_type in ("CreateIssuePayload", "CloseIssuePayload"):
+        if name == "issue":
+            node = obj.get("issue")
+            if node is None:
+                return None, True
+            return execute_selection(node, sub_selections, variables,
+                                     fragments, errors, path), True
+        return None, False
+    if obj_type in ("CreatePullRequestPayload", "MergePullRequestPayload"):
+        if name == "pullRequest":
+            node = obj.get("pullRequest")
+            if node is None:
+                return None, True
+            return execute_selection(node, sub_selections, variables,
+                                     fragments, errors, path), True
+        return None, False
+    if obj_type == "AddCommentPayload":
+        if name == "commentEdge":
+            edge = obj.get("commentEdge")
+            if edge is None:
+                return None, True
+            return execute_selection(edge, sub_selections, variables,
+                                     fragments, errors, path), True
+        return None, False
+    if obj_type == "Comment":
+        if name == "id":
+            return obj.get("id"), True
+        if name == "body":
+            return obj.get("body"), True
         return None, False
     return None, False
 
